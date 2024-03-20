@@ -1,8 +1,13 @@
-import torch 
+
 import pandas as pd 
 
-from transformers.models.bert.configuration_bert import BertConfig
-from transformers import AutoTokenizer, AutoModel
+from pathlib import Path
+
+import torch 
+from hyena import (
+    HyenaDNAPreTrainedModel, 
+    CharacterTokenizer
+)
 
 class GenomicsEncoder():
     def __init__(self, 
@@ -46,22 +51,70 @@ class GenomicsEncoder():
             protein_sequence_representations.append(token_representations[i, 1 : tokens_len - 1].mean(0))
         return protein_sequence_representations
 
-    def _initialize_gene_sequence_encoder(self):
-        config = BertConfig.from_pretrained("zhihan1996/DNABERT-2-117M")
-        self.gene_sequence_tokenizer = AutoTokenizer.from_pretrained("zhihan1996/DNABERT-2-117M", trust_remote_code=True)
-        self.gene_sequence_encoder = AutoModel.from_pretrained("zhihan1996/DNABERT-2-117M", trust_remote_code=True, config=config)
+    def _initialize_gene_sequence_encoder(self,
+                                          pretrained_model_name: str = 'hyenadna-small-160k-seqlen',
+                                          use_padding: bool = True,
+                                          rc_aug: bool = False,
+                                          add_eos: bool = False,
+                                          use_head: bool = False, # decoder head
+                                          n_classes: int = 1,
+                                          backbone_cfg = None):        
+        '''
+        this selects which backbone to use, and grabs weights/ config from HF
+        4 options:
+            'hyenadna-tiny-1k-seqlen'   # fine-tune on colab ok
+            'hyenadna-small-32k-seqlen'
+            'hyenadna-medium-160k-seqlen'  # inference only on colab
+            'hyenadna-medium-450k-seqlen'  # inference only on colab
+            'hyenadna-large-1m-seqlen'  # inference only on colab
+        '''
+
+        max_lengths = {
+            'hyenadna-tiny-1k-seqlen': 1024,
+            'hyenadna-small-32k-seqlen': 32768,
+            'hyenadna-medium-160k-seqlen': 160000,
+            'hyenadna-medium-450k-seqlen': 450000,  # T4 up to here
+            'hyenadna-large-1m-seqlen': 1_000_000,  # only A100 (paid tier)
+        }
+        
+        max_length = max_lengths[pretrained_model_name]
+        if pretrained_model_name in ['hyenadna-tiny-1k-seqlen',
+                                    'hyenadna-small-32k-seqlen',
+                                    'hyenadna-medium-160k-seqlen',
+                                    'hyenadna-medium-450k-seqlen',
+                                    'hyenadna-large-1m-seqlen']:
+            # use the pretrained Huggingface wrapper instead
+            self.gene_sequence_encoder = HyenaDNAPreTrainedModel.from_pretrained(
+                './model_weights',
+                pretrained_model_name,
+                download=True,
+                config=backbone_cfg,
+                device=self.device,
+                use_head=use_head,
+                n_classes=n_classes,
+            )
+        else:
+            self.gene_sequence_encoder = None
+            assert self.gene_sequence_encoder is None, "[Error] Model name is not found!"
+        
+        self.gene_sequence_tokenizer = CharacterTokenizer(
+            characters=['A', 'C', 'G', 'T', 'N'],  # add DNA characters, N is uncertain
+            model_max_length=max_length + 2,  # to account for special tokens, like EOS
+            add_special_tokens=False,  # we handle special tokens elsewhere
+            padding_side='left', # since HyenaDNA is causal, we pad on the left
+        )
 
     def encode_gene_sequence(self, 
                              gene_sequence):
-        inputs = self.gene_sequence_tokenizer(gene_sequence, 
-                                              return_tensors='pt')["input_ids"]
-        hidden_states = self.gene_sequence_encoder(inputs)[0] # [1, sequence_length, 768]
+        tokenized_sequence = self.gene_sequence_tokenizer(gene_sequence)["input_ids"]
 
-        # Embedding with max pooling
-        # embedding_max = torch.max(hidden_states[0], dim=0)[0]
+        tokenized_sequence = torch.LongTensor(tokenized_sequence).unsqueeze(0)
+        tokenized_sequence = tokenized_sequence.to(self.device)
 
-        # Embedding with mean pooling
-        gene_sequence_embedding = torch.mean(hidden_states[0], dim=0)
+        self.gene_sequence_encoder = self.gene_sequence_encoder.to(self.device)
+        self.gene_sequence_encoder.eval()
+        with torch.inference_mode():
+            gene_sequence_embedding = self.gene_sequence_encoder(tokenized_sequence)
         return gene_sequence_embedding
         
 if __name__=="__main__":
@@ -89,4 +142,3 @@ if __name__=="__main__":
     example_gene_sequene = "ACGTAGCATCGGATCTATCTATCGACACTTGGTTATCGATCTACGAGCATCTCGTTAGC"
     gene_sequence_representations = genomic_encoder.encode_gene_sequence(example_gene_sequene)
     print("Embedding for gene sequence:", gene_sequence_representations)
-    
